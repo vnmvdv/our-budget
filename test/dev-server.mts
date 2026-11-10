@@ -10,6 +10,8 @@ const mem = new Map<string, string>();
   async delete(k: string) { mem.delete(k); },
   async list(o?: { prefix?: string }) { return { blobs: [...mem.keys()].filter((k) => k.startsWith(o?.prefix ?? "")).sort().map((key) => ({ key })) }; },
 };
+(globalThis as any).__BUDGET_MAIL = async (m: any) => { console.log("MAIL", m.to, m.text); };
+(globalThis as any).__BUDGET_PUSH = async (u: string, p: any) => { console.log("PUSH", u, JSON.stringify(p)); };
 const { default: api } = await import("../netlify/functions/api.mts");
 const types: Record<string, string> = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".woff2": "font/woff2", ".png": "image/png", ".svg": "image/svg+xml", ".webmanifest": "application/manifest+json" };
 const root = join(process.cwd(), "public");

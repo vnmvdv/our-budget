@@ -16,13 +16,14 @@ const daysIn = (m) => { const [y, mo] = ymd(m); return new Date(y, mo, 0).getDat
 const monthName = (m, o = { month: "long", year: "numeric" }) => { const [y, mo] = ymd(m); return new Date(y, mo - 1, 1).toLocaleDateString("en-GB", o); };
 const dateObj = (ds) => { const [y, m, d] = ds.split("-").map(Number); return new Date(y, m - 1, d); };
 const dowMon = (ds) => (dateObj(ds).getDay() + 6) % 7; // Monday = 0
+const ymdOf = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const dayLabel = (ds) => {
-  const t = todayStr();
-  if (ds === t) return "Today";
+  if (ds === todayStr()) return "Today";
   const y = new Date(); y.setDate(y.getDate() - 1);
-  if (ds === `${y.getFullYear()}-${pad(y.getMonth() + 1)}-${pad(y.getDate())}`) return "Yesterday";
+  if (ds === ymdOf(y)) return "Yesterday";
   return dateObj(ds).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
 };
+const timeLabel = (ts) => new Date(ts).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
 
 function eur(n) {
   if (!Number.isFinite(n)) n = 0;
@@ -36,9 +37,9 @@ const eur0 = (n) => `${n < -0.5 ? "−" : ""}€${Math.abs(Math.round(n)).toLoca
 
 /* ============ state ============ */
 const S = {
-  key: localStorage.getItem("ob.key") || "",
-  me: localStorage.getItem("ob.me") || "",
+  token: localStorage.getItem("ob.token") || "",
   data: null,
+  status: { users: 0, emailEnabled: false },
   tab: "today",
   month: monthOf(todayStr()),
   filterCat: "all",
@@ -47,20 +48,45 @@ const S = {
   stale: false,
   lastSig: "",
   lastCat: localStorage.getItem("ob.lastcat") || "",
+  draft: null,
+  log: null,
+  logWho: "all",
+  logOnly: false,
 };
-const names = () => S.data?.meta?.names ?? { a: "Me", b: "Partner" };
+const meUser = () => S.data.me;
+const mySlot = () => S.data.me.slot;
+const names = () => {
+  const u = S.data?.users ?? [];
+  const f = (s) => u.find((x) => x.slot === s)?.name;
+  return { a: f("a") || "Partner", b: f("b") || "Partner" };
+};
+const otherSlot = () => (mySlot() === "a" ? "b" : "a");
+const otherName = () => names()[otherSlot()];
+const userName = (id) => S.data.users.find((u) => u.id === id)?.name ?? "Someone";
 const catById = () => Object.fromEntries(S.data.cats.map((c) => [c.id, c]));
+const catName = (id) => catById()[id]?.name ?? "Category";
 const activeCats = () => S.data.cats.filter((c) => !c.archived).sort((a, b) => a.order - b.order);
+
+/* requests that need approval */
+const pendingReqs = () => (S.data.requests ?? []).filter((r) => r.status === "pending");
+const toApprove = () => pendingReqs().filter((r) => r.uid !== meUser().id);
+const waitingOn = () => pendingReqs().filter((r) => r.uid === meUser().id);
+const pendingDeleteFor = (expId) => pendingReqs().find((r) => r.type === "expense.delete" && r.payload.expenseId === expId);
+const pendingBudget = () => pendingReqs().find((r) => r.type === "budget.change");
+const decidedNotices = () => {
+  const seen = Number(localStorage.getItem("ob.seen")) || 0;
+  return (S.data.requests ?? []).filter((r) => r.uid === meUser().id && (r.status === "approved" || r.status === "declined") && (r.decidedAt ?? 0) > seen);
+};
 
 /* ============ api ============ */
 async function api(method, path, body) {
   const res = await fetch("/api" + path, {
     method,
-    headers: { "content-type": "application/json", "x-household-key": S.key || "" },
+    headers: { "content-type": "application/json", ...(S.token ? { authorization: `Bearer ${S.token}` } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401 && S.data) { lock(); throw new Error("Passphrase changed. Enter it again."); }
+  if (res.status === 401 && S.token && S.data) { signOutLocal(); throw Object.assign(new Error("Please log in again."), { status: 401 }); }
   if (!res.ok) throw Object.assign(new Error(data.error || "Request failed"), { status: res.status });
   return data;
 }
@@ -76,7 +102,7 @@ async function refresh(force = false) {
   render();
 }
 
-/** Apply a change locally right away, then save it; if saving fails, reload the truth. */
+/** Apply a change locally right away, then save it; if saving fails, show why and reload the truth. */
 async function mutate(applyLocal, request) {
   applyLocal();
   S.lastSig = "";
@@ -128,7 +154,6 @@ function calc(month) {
     out.todaySpent = t.spent;
     out.todayLeft = t.allowance - t.spent;
     out.flexRemaining = flexBudget - flexSpent;
-    // week (Monday start), clipped to this month
     const weekStartDay = Math.max(1, dom - dowMon(today));
     const weekEndDay = Math.min(dim, dom + (6 - dowMon(today)));
     const wd = weekEndDay - weekStartDay + 1;
@@ -141,24 +166,83 @@ function calc(month) {
 }
 
 /* ============ icons ============ */
+const svg = (d, extra = "") => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" ${extra}>${d}</svg>`;
 const I = {
-  today: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 13a8 8 0 0 1 16 0"/><path d="M12 13l4-4"/><path d="M4 18h16"/></svg>',
-  list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/></svg>',
-  chart: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 20V11M12 20V5M19 20v-6"/></svg>',
-  goal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3.5"/></svg>',
-  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
-  gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5h0a1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
-  prev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>',
-  next: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg>',
+  today: svg('<path d="M4 13a8 8 0 0 1 16 0"/><path d="M12 13l4-4"/><path d="M4 18h16"/>'),
+  list: svg('<path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/>'),
+  chart: svg('<path d="M5 20V11M12 20V5M19 20v-6"/>'),
+  goal: svg('<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3.5"/>'),
+  plus: svg('<path d="M12 5v14M5 12h14"/>', 'stroke-width="2.6"'),
+  gear: svg('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5h0a1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>'),
+  clock: svg('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'),
+  prev: svg('<path d="M15 5l-7 7 7 7"/>', 'stroke-width="2.4"'),
+  next: svg('<path d="M9 5l7 7-7 7"/>', 'stroke-width="2.4"'),
 };
 
-/* ============ rendering ============ */
+/* ============ shared pieces ============ */
 const app = $("#app");
 
+function topbar(title, sub, { back = false } = {}) {
+  const n = toApprove().length;
+  return `<header class="topbar"><div class="topbar-l">${back ? `<button class="icon-btn" data-action="tab" data-tab="today" aria-label="Back">${I.prev}</button>` : ""}<div><h1>${esc(title)}</h1>${sub ? `<p class="sub">${esc(sub)}</p>` : ""}</div></div>
+    <div class="topbar-r"><button class="icon-btn" data-action="tab" data-tab="history" aria-label="${n ? `History, ${n} waiting for you` : "History"}">${I.clock}${n ? `<span class="badge">${n}</span>` : ""}</button>
+    <button class="icon-btn" data-action="settings" aria-label="Settings">${I.gear}</button></div></header>`;
+}
+
+function expLabel(x) { return `${eur(x.amount)} · ${catName(x.catId)}${x.note ? ` · ${x.note}` : ""}`; }
+
+function budgetLines(changes, before) {
+  return changes.map((c, i) => {
+    const b = before?.[i];
+    const tag = `${c.icon} ${c.name}`;
+    if (!b) return `New: ${tag}, ${eur(c.monthly)} a month${c.fixed ? " (fixed)" : ""}`;
+    if (c.archived && !b.archived) return `Remove: ${tag}`;
+    const bits = [];
+    if (b.name !== c.name) bits.push(`renamed from “${b.name}”`);
+    if (b.monthly !== c.monthly) bits.push(`${eur(b.monthly)} → ${eur(c.monthly)}`);
+    if (b.fixed !== c.fixed) bits.push(c.fixed ? "now a fixed cost" : "now an everyday cost");
+    if (b.icon !== c.icon) bits.push("new icon");
+    return `${tag}: ${bits.join(", ") || "updated"}`;
+  });
+}
+
+/** The cards at the top of every screen: things waiting on you, things you're waiting on, news. */
+function approvals() {
+  const out = [];
+  for (const r of toApprove()) {
+    const who = userName(r.uid);
+    if (r.type === "expense.delete") {
+      const x = r.payload.snapshot;
+      out.push(`<section class="ask" aria-label="Approval needed"><p class="ask-title">${esc(who)} wants to delete an expense</p>
+        <div class="ask-item"><span class="glyph" aria-hidden="true">${esc(catById()[x.catId]?.icon || "•")}</span><div class="row-main"><div class="row-title">${esc(x.note || catName(x.catId))}</div><div class="row-sub">${esc(catName(x.catId))} · ${esc(dayLabel(x.date))} · added by ${esc(names()[x.by])}</div></div><span class="row-amt num">${eur(x.amount)}</span></div>
+        <div class="btn-row"><button class="btn small" data-action="decide" data-id="${esc(r.id)}" data-op="approve">Approve deletion</button><button class="btn small alt" data-action="decide" data-id="${esc(r.id)}" data-op="decline">Keep it</button></div></section>`);
+    } else {
+      out.push(`<section class="ask" aria-label="Approval needed"><p class="ask-title">${esc(who)} wants to change the budget</p>
+        <ul class="ask-list">${budgetLines(r.payload.changes, r.payload.before).map((l) => `<li>${esc(l)}</li>`).join("")}</ul>
+        <div class="btn-row"><button class="btn small" data-action="decide" data-id="${esc(r.id)}" data-op="approve">Approve change</button><button class="btn small alt" data-action="decide" data-id="${esc(r.id)}" data-op="decline">Decline</button></div></section>`);
+    }
+  }
+  for (const r of waitingOn()) {
+    const what = r.type === "expense.delete" ? `deleting ${expLabel(r.payload.snapshot)}` : "your budget change";
+    out.push(`<section class="note"><p>Waiting for ${esc(otherName())} to approve ${esc(what)}.</p><button class="link" data-action="decide" data-id="${esc(r.id)}" data-op="cancel">Cancel request</button></section>`);
+  }
+  for (const r of decidedNotices()) {
+    const what = r.type === "expense.delete" ? `deleting ${expLabel(r.payload.snapshot)}` : "your budget change";
+    out.push(`<section class="note ${r.status === "declined" ? "no" : "yes"}"><p>${esc(userName(r.decidedBy))} ${r.status} ${esc(what)}.</p><button class="link" data-action="dismiss-notices">Dismiss</button></section>`);
+  }
+  if (pushSupported() && Notification.permission === "default" && !S.data.pushOn && !localStorage.getItem("ob.pushno")) {
+    const ios = isIos() && !isStandalone();
+    out.push(`<section class="note"><p><b>Get notified on your phone</b> when ${esc(otherName())} needs your approval.${ios ? " On iPhone, first add this app to your Home Screen (Share, then Add to Home Screen) and open it from there." : ""}</p>
+      <div class="btn-row">${ios ? "" : '<button class="btn small" data-action="push-on">Turn on</button>'}<button class="link" data-action="push-no">Not now</button></div></section>`);
+  }
+  return out.join("");
+}
+
+/* ============ rendering ============ */
 function render() {
   if (!S.data) return;
   const y = window.scrollY;
-  const views = { today: viewToday, spending: viewSpending, insights: viewInsights, goals: viewGoals };
+  const views = { today: viewToday, spending: viewSpending, insights: viewInsights, goals: viewGoals, history: viewHistory };
   app.innerHTML = `<div class="shell">${(views[S.tab] || viewToday)()}</div>${tabbar()}`;
   window.scrollTo(0, y);
 }
@@ -170,11 +254,6 @@ function tabbar() {
     <button class="fab" data-action="add" aria-label="Add expense">${I.plus}</button>
     ${t("insights", "Insights", I.chart)}${t("goals", "Goals", I.goal)}
   </div></nav>`;
-}
-
-function topbar(title, sub) {
-  return `<header class="topbar"><div><h1>${esc(title)}</h1>${sub ? `<p class="sub">${esc(sub)}</p>` : ""}</div>
-    <button class="icon-btn" data-action="settings" aria-label="Settings">${I.gear}</button></header>`;
 }
 
 function envelope(c, k, isCur) {
@@ -213,9 +292,8 @@ function viewToday() {
   }).join("");
   const wkPct = k.weekAllowance > 0 ? Math.min(100, (k.weekSpent / k.weekAllowance) * 100) : 100;
   const moPct = k.budget > 0 ? Math.min(100, (k.total / k.budget) * 100) : 0;
-  const d = new Date();
-  const title = d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" });
-  return `${topbar(title, `Hi ${names()[S.me] || ""}`.trim())}
+  const title = new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" });
+  return `${topbar(title, `Hi ${meUser().name}`)}${approvals()}
   <section class="hero ${over || used ? "is-over" : ""}" aria-label="Today">
     <p class="hero-label">${label}</p>
     <p class="hero-num">${num}</p>
@@ -252,18 +330,18 @@ function viewSpending() {
   const catChips = [`<button class="chip" data-action="set-filter" data-kind="cat" data-id="all" aria-pressed="${S.filterCat === "all"}">All</button>`]
     .concat(activeCats().map((c) => `<button class="chip" data-action="set-filter" data-kind="cat" data-id="${esc(c.id)}" aria-pressed="${S.filterCat === c.id}">${esc(c.icon)} ${esc(c.name)}</button>`)).join("");
   const whoChips = ["all", "a", "b"].map((w) => `<button class="chip" data-action="set-filter" data-kind="who" data-id="${w}" aria-pressed="${S.filterWho === w}">${w === "all" ? "Both of us" : esc(nm[w])}</button>`).join("");
-  const canNext = S.month < monthOf(todayStr());
   const body = groups.length
     ? groups.map((g) => `<div class="day"><div class="day-head"><span>${esc(dayLabel(g.date))}</span><span class="num">${eur(g.items.reduce((s, e) => s + e.amount, 0))}</span></div>
         <div class="rows">${g.items.map((e) => {
           const c = byId[e.catId];
+          const pend = pendingDeleteFor(e.id);
           return `<button class="row" data-action="edit-expense" data-id="${esc(e.id)}"><span class="glyph" aria-hidden="true">${esc(c?.icon || "•")}</span>
             <div class="row-main"><div class="row-title">${esc(e.note || c?.name || "Expense")}</div>
-            <div class="row-sub"><span class="dot ${e.who === "b" ? "b" : ""}"></span>${esc(nm[e.who])}${e.note ? ` · ${esc(c?.name || "")}` : ""}</div></div>
+            <div class="row-sub"><span class="dot ${e.who === "b" ? "b" : ""}"></span>${esc(nm[e.who])}${e.note ? ` · ${esc(c?.name || "")}` : ""}${pend ? ' <span class="tag">Deletion requested</span>' : ""}</div></div>
             <span class="row-amt num">${eur(e.amount)}</span></button>`;
         }).join("")}</div></div>`).join("")
     : `<div class="empty"><b>Nothing here yet</b>${S.filterCat !== "all" || S.filterWho !== "all" ? "No expenses match these filters." : `No expenses logged for ${esc(monthName(S.month))}. Tap + to add the first one.`}</div>`;
-  return `${topbar("Spending", `${eur(sum)} in ${monthName(S.month)}`)}
+  return `${topbar("Spending", `${eur(sum)} in ${monthName(S.month)}`)}${approvals()}
   ${monthNav()}
   <div class="chips" aria-label="Filter by category">${catChips}</div>
   <div class="chips" aria-label="Filter by person" style="margin-top:-6px">${whoChips}</div>
@@ -279,7 +357,6 @@ function monthNav() {
 function viewInsights() {
   const nm = names();
   const k = calc(S.month);
-  // last 6 months ending at S.month
   const months = [];
   for (let i = 5; i >= 0; i--) months.push(addMonths(S.month, -i));
   const totals = months.map((m) => S.data.expenses.filter((e) => e.date.startsWith(m)).reduce((s, e) => s + e.amount, 0));
@@ -304,7 +381,6 @@ function viewInsights() {
     <div class="tip" hidden></div></div>
     <div class="legend"><span><i class="dot"></i>Spent</span><span><i class="dot" style="background:var(--poppy)"></i>Over budget</span>${budget ? '<span><i class="ln"></i>Monthly budget</span>' : ""}</div>`;
 
-  // categories ranked
   const nonzero = k.cats.concat(S.data.cats.filter((c) => c.archived && k.spent[c.id])).filter((c) => (k.spent[c.id] || 0) > 0)
     .sort((a, b) => (k.spent[b.id] || 0) - (k.spent[a.id] || 0));
   const topSpent = Math.max(...nonzero.map((c) => k.spent[c.id]), 1);
@@ -317,7 +393,6 @@ function viewInsights() {
       }).join("")}</div>`
     : '<p class="hint">No spending logged this month yet.</p>';
 
-  // who
   const byWho = { a: 0, b: 0 };
   for (const e of k.exps) byWho[e.who] += e.amount;
   const whoTotal = byWho.a + byWho.b;
@@ -326,11 +401,10 @@ function viewInsights() {
        <div class="split-keys"><div><span class="dot"></span><span>${esc(nm.a)} <b class="num">${eur(byWho.a)}</b></span></div><div><span class="dot b"></span><span>${esc(nm.b)} <b class="num">${eur(byWho.b)}</b></span></div></div>`
     : '<p class="hint">Nothing logged this month yet.</p>';
 
-  // stats
   const elapsed = k.isCur ? k.dom : k.dim;
-  const noSpend = k.days.slice(0, elapsed).filter((d) => d.spent <= 0.004 && !k.exps.some((e) => e.date === d.ds)).length;
+  const noSpend = k.days.slice(0, elapsed).filter((d) => !k.exps.some((e) => e.date === d.ds)).length;
   const biggest = k.exps.reduce((m, e) => (e.amount > (m?.amount || 0) ? e : m), null);
-  return `${topbar("Insights", monthName(S.month))}
+  return `${topbar("Insights", monthName(S.month))}${approvals()}
   ${monthNav()}
   <section class="panel"><h2>Last six months</h2>${chart}</section>
   <section class="panel"><h2>Where it went <small>${monthName(S.month, { month: "long" })}</small></h2>${rank}</section>
@@ -368,8 +442,86 @@ function viewGoals() {
         </article>`;
       }).join("")
     : '<div class="empty"><b>No goals yet</b>Set something you are saving for together, like a trip or a deposit.</div>';
-  return `${topbar("Goals", "Saving together")}${body}
+  return `${topbar("Goals", "Saving together")}${approvals()}${body}
   <button class="btn alt" style="margin-top:4px" data-action="new-goal">New goal</button>`;
+}
+
+/* ============ history ============ */
+function diffExp(a, b) {
+  const out = [];
+  if (a.amount !== b.amount) out.push(`amount ${eur(a.amount)} → ${eur(b.amount)}`);
+  if (a.catId !== b.catId) out.push(`category ${catName(a.catId)} → ${catName(b.catId)}`);
+  if ((a.note || "") !== (b.note || "")) out.push(`note “${a.note || ""}” → “${b.note || ""}”`);
+  if (a.who !== b.who) out.push(`paid by ${names()[a.who]} → ${names()[b.who]}`);
+  if (a.date !== b.date) out.push(`date ${a.date} → ${b.date}`);
+  return out.join(" · ");
+}
+function logLine(e) {
+  const n = userName(e.uid), d = e.data || {};
+  const nm = names();
+  switch (e.type) {
+    case "user.register": return [`${n} created their account`, ""];
+    case "user.name": return [`${n} changed their name`, `${d.from} → ${d.to}`];
+    case "user.password": return [`${n} ${d.how === "reset-link" ? "reset" : "changed"} their password`, ""];
+    case "expense.add": return [`${n} added ${expLabel(d.exp)}`, `Paid by ${nm[d.exp.who]} · ${dayLabel(d.exp.date)}`];
+    case "expense.edit": return [`${n} edited an expense`, `${expLabel(d.before)}: ${diffExp(d.before, d.after)}`];
+    case "expense.delete.request": return [`${n} asked to delete ${expLabel(d.exp)}`, `Added by ${nm[d.exp.by]} on ${dayLabel(d.exp.date)}`];
+    case "expense.delete.approve": return [`${n} approved deleting ${expLabel(d.exp)}`, `Added by ${nm[d.exp.by]}. It was removed from the budget.`];
+    case "expense.delete.decline": return [`${n} kept ${expLabel(d.exp)}`, "Deletion declined"];
+    case "expense.delete.cancel": return [`${n} withdrew the request to delete ${expLabel(d.exp)}`, ""];
+    case "budget.request": return [`${n} asked to change the budget`, budgetLines(d.changes, d.before).join(" · ")];
+    case "budget.approve": return [`${n} approved a budget change`, budgetLines(d.changes, []).length ? d.changes.map((c) => `${c.icon} ${c.name} ${eur(c.monthly)}`).join(" · ") : ""];
+    case "budget.decline": return [`${n} declined a budget change`, ""];
+    case "budget.cancel": return [`${n} withdrew a budget change`, ""];
+    case "goal.add": return [`${n} created the goal “${d.after.name}”`, `Target ${eur(d.after.target)}`];
+    case "goal.edit": return [`${n} edited the goal “${d.after.name}”`, d.before ? `${d.before.name} ${eur(d.before.target)} → ${d.after.name} ${eur(d.after.target)}` : ""];
+    case "goal.delete": return [`${n} deleted the goal “${d.goal?.name ?? ""}”`, `It had ${eur((d.contribs || []).reduce((s, c) => s + c.amount, 0))} saved`];
+    case "contrib.add": return [`${n} ${d.after.amount < 0 ? "took out" : "added"} ${eur(Math.abs(d.after.amount))} ${d.after.amount < 0 ? "from" : "to"} a goal`, `${nm[d.after.who]} · ${dayLabel(d.after.date)}${d.after.note ? ` · ${d.after.note}` : ""}`];
+    case "contrib.edit": return [`${n} edited a goal entry`, `${eur(d.before.amount)} → ${eur(d.after.amount)}`];
+    case "contrib.delete": return [`${n} deleted a goal entry of ${eur(d.contrib?.amount ?? 0)}`, ""];
+    default: return [`${n}: ${e.type}`, ""];
+  }
+}
+const isSensitive = (t) => /delete|budget|edit|password/.test(t);
+
+function viewHistory() {
+  const nm = names();
+  let list = S.log;
+  let body;
+  if (!list) body = '<div class="loading">Loading…</div>';
+  else {
+    if (S.logWho !== "all") list = list.filter((e) => S.data.users.find((u) => u.id === e.uid)?.slot === S.logWho);
+    if (S.logOnly) list = list.filter((e) => isSensitive(e.type));
+    const groups = [];
+    for (const e of list) {
+      const ds = ymdOf(new Date(e.ts));
+      const g = groups[groups.length - 1];
+      if (g && g.ds === ds) g.items.push(e); else groups.push({ ds, items: [e] });
+    }
+    body = groups.length
+      ? groups.map((g) => `<div class="day"><div class="day-head"><span>${esc(dayLabel(g.ds))}</span></div><div class="rows">${g.items.map((e) => {
+          const [t, sub] = logLine(e);
+          const slot = S.data.users.find((u) => u.id === e.uid)?.slot;
+          return `<div class="row log"><span class="dot ${slot === "b" ? "b" : ""}" aria-hidden="true"></span><div class="row-main"><div class="log-t">${esc(t)}</div>${sub ? `<div class="row-sub">${esc(sub)}</div>` : ""}</div><span class="log-time num">${timeLabel(e.ts)}</span></div>`;
+        }).join("")}</div></div>`).join("")
+      : '<div class="empty"><b>Nothing here</b>No entries match.</div>';
+  }
+  const chips = `<button class="chip" data-action="log-who" data-id="all" aria-pressed="${S.logWho === "all"}">Both of us</button>` +
+    ["a", "b"].map((w) => `<button class="chip" data-action="log-who" data-id="${w}" aria-pressed="${S.logWho === w}">${esc(nm[w])}</button>`).join("") +
+    `<button class="chip" data-action="log-only" aria-pressed="${S.logOnly}">Deletions, edits and budget</button>`;
+  return `${topbar("History", "Everything either of you has done", { back: true })}${approvals()}
+  <p class="hint" style="margin:0 4px 12px">This list can't be edited or cleared by either of you. Deleted items stay recorded here.</p>
+  <div class="chips">${chips}</div>${body}`;
+}
+
+async function loadLog(quiet) {
+  try {
+    const r = await api("GET", "/log?limit=300");
+    const sig = JSON.stringify(r.entries.map((e) => e.id));
+    if (quiet && S.log && JSON.stringify(S.log.map((e) => e.id)) === sig) return;
+    S.log = r.entries;
+    if (S.tab === "history" && !S.sheet) render();
+  } catch (e) { if (!quiet) toast(e.message); }
 }
 
 /* ============ sheets ============ */
@@ -382,12 +534,8 @@ function openSheet(title, inner, { dismissible = true } = {}) {
   const first = $("[data-autofocus]", sheetRoot);
   if (first) setTimeout(() => first.focus({ preventScroll: true }), 60);
 }
-function closeSheet() {
-  S.sheet = false;
-  sheetRoot.innerHTML = "";
-  if (S.stale) { S.stale = false; }
-  render();
-}
+function closeSheet() { S.sheet = false; sheetRoot.innerHTML = ""; S.draft = null; S.stale = false; render(); }
+function closeSheetQuiet() { S.sheet = false; sheetRoot.innerHTML = ""; S.draft = null; }
 
 function whoSeg(sel, name = "who") {
   const nm = names();
@@ -396,12 +544,16 @@ function whoSeg(sel, name = "who") {
 
 function expenseSheet(exp) {
   const editing = !!exp;
+  if (editing) {
+    const pend = pendingDeleteFor(exp.id);
+    if (exp.by !== mySlot() || pend) return expenseDetailSheet(exp, pend);
+  }
   const cats = activeCats();
   const byId = catById();
   const catList = cats.slice();
   if (editing && byId[exp.catId]?.archived) catList.push(byId[exp.catId]);
   const selCat = exp?.catId || (cats.some((c) => c.id === S.lastCat) ? S.lastCat : "");
-  const who = exp?.who || S.me || "a";
+  const who = exp?.who || mySlot();
   openSheet(editing ? "Edit expense" : "Add expense", `<form data-form="expense" class="stack" ${editing ? `data-id="${esc(exp.id)}" data-month="${esc(monthOf(exp.date))}"` : ""} novalidate>
     <div class="field"><label for="f-amount" class="lbl">Amount</label><div class="amount-wrap"><span>€</span><input id="f-amount" name="amount" inputmode="decimal" autocomplete="off" placeholder="0" value="${editing ? exp.amount : ""}" ${editing ? "" : "data-autofocus"}></div></div>
     <div class="field"><span class="lbl">Category</span><div class="cats" role="group" aria-label="Category">${catList.map((c) => `<button type="button" class="cat-pick" data-action="pick-cat" data-id="${esc(c.id)}" aria-pressed="${selCat === c.id}"><span class="e">${esc(c.icon)}</span>${esc(c.name)}</button>`).join("")}</div><input type="hidden" name="catId" value="${esc(selCat)}"></div>
@@ -410,8 +562,19 @@ function expenseSheet(exp) {
     <div class="field"><label for="f-date" class="lbl">Date</label><input class="input" id="f-date" name="date" type="date" value="${esc(exp?.date || todayStr())}"></div>
     <p class="err" data-err></p>
     <button class="btn" type="submit">${editing ? "Save changes" : "Add expense"}</button>
-    ${editing ? '<button class="btn danger" type="button" data-action="delete-expense">Delete expense</button>' : ""}
+    ${editing ? `<button class="btn danger" type="button" data-action="ask-delete" data-id="${esc(exp.id)}" data-month="${esc(monthOf(exp.date))}">Ask ${esc(otherName())} to approve deleting</button><p class="hint">Entries can't be deleted on your own. ${esc(otherName())} has to approve first, and every edit is kept in History.</p>` : `<p class="hint">Once added, an entry can only be removed if ${esc(otherName())} approves.</p>`}
   </form>`);
+}
+
+function expenseDetailSheet(exp, pend) {
+  const c = catById()[exp.catId];
+  const mine = exp.by === mySlot();
+  openSheet("Expense", `<div class="stack">
+    <div class="detail"><span class="glyph" aria-hidden="true">${esc(c?.icon || "•")}</span><div class="row-main"><div class="row-title">${esc(exp.note || c?.name || "Expense")}</div><div class="row-sub">${esc(c?.name || "")} · ${esc(dayLabel(exp.date))}</div></div><span class="row-amt num">${eur(exp.amount)}</span></div>
+    <p class="hint">Paid by ${esc(names()[exp.who])}. Added by ${esc(names()[exp.by])}${exp.editedAt ? ", edited later (see History)" : ""}.${mine ? "" : " Only the person who added it can edit it."}</p>
+    ${pend ? `<p class="note-inline">${pend.uid === meUser().id ? `Waiting for ${esc(otherName())} to approve deleting this.` : `${esc(userName(pend.uid))} asked to delete this. Approve or decline above.`}</p>${pend.uid === meUser().id ? `<button class="btn alt" data-action="decide" data-id="${esc(pend.id)}" data-op="cancel" data-close="1">Cancel the request</button>` : ""}`
+        : `<button class="btn danger" data-action="ask-delete" data-id="${esc(exp.id)}" data-month="${esc(monthOf(exp.date))}">Ask ${esc(otherName())} to approve deleting</button>`}
+  </div>`);
 }
 
 function parseAmount(v) {
@@ -426,7 +589,7 @@ function goalSheet(g) {
     <div class="field"><label class="lbl" for="g-date">Reach it by (optional)</label><input class="input" id="g-date" name="deadline" type="date" value="${esc(g?.deadline || "")}"></div>
     <p class="err" data-err></p>
     <button class="btn" type="submit">${g ? "Save changes" : "Create goal"}</button>
-    ${g ? '<button class="btn danger" type="button" data-action="delete-goal">Delete goal</button>' : ""}
+    ${g ? '<button class="btn danger" type="button" data-action="delete-goal">Delete goal</button><p class="hint">Goal changes are recorded in History.</p>' : ""}
   </form>`);
 }
 
@@ -436,7 +599,7 @@ function contribSheet(goalId, c) {
   openSheet(c ? "Edit entry" : `Add to ${g?.name || "goal"}`, `<form data-form="contrib" class="stack" data-goal="${esc(goalId)}" ${c ? `data-id="${esc(c.id)}"` : ""} novalidate>
     <div class="seg" role="group" aria-label="Type"><button type="button" data-action="pick-dir" data-dir="1" aria-pressed="${!neg}">Add money</button><button type="button" data-action="pick-dir" data-dir="-1" aria-pressed="${!!neg}">Take out</button><input type="hidden" name="dir" value="${neg ? -1 : 1}"></div>
     <div class="field"><label class="lbl" for="c-amount">Amount</label><div class="amount-wrap"><span>€</span><input id="c-amount" name="amount" inputmode="decimal" autocomplete="off" placeholder="0" value="${c ? Math.abs(c.amount) : ""}" data-autofocus></div></div>
-    <div class="field"><span class="lbl">Who</span>${whoSeg(c?.who || S.me || "a")}</div>
+    <div class="field"><span class="lbl">Who</span>${whoSeg(c?.who || mySlot())}</div>
     <div class="field"><label class="lbl" for="c-note">Note (optional)</label><input class="input" id="c-note" name="note" maxlength="60" value="${esc(c?.note || "")}"></div>
     <div class="field"><label class="lbl" for="c-date">Date</label><input class="input" id="c-date" name="date" type="date" value="${esc(c?.date || todayStr())}"></div>
     <p class="err" data-err></p>
@@ -445,110 +608,190 @@ function contribSheet(goalId, c) {
   </form>`);
 }
 
-function settingsSheet() {
-  const nm = names();
-  const catRows = S.data.cats.filter((c) => !c.archived).sort((a, b) => a.order - b.order).map((c) => `<div class="set-cat" data-cat="${esc(c.id)}">
-      <input class="input icon-in" data-field="icon" value="${esc(c.icon)}" maxlength="4" aria-label="Icon for ${esc(c.name)}">
-      <input class="input" data-field="name" value="${esc(c.name)}" maxlength="30" aria-label="Category name">
-      <input class="input" data-field="monthly" inputmode="decimal" value="${c.monthly}" aria-label="Monthly budget for ${esc(c.name)}">
-      <div class="set-cat-foot"><label class="check"><input type="checkbox" data-field="fixed" ${c.fixed ? "checked" : ""}> Fixed monthly cost</label><button class="link" data-action="archive-cat" data-id="${esc(c.id)}">Remove</button></div></div>`).join("");
-  const total = activeCats().reduce((s, c) => s + c.monthly, 0);
-  openSheet("Settings", `<div class="stack">
-    <div class="field"><span class="lbl">Names</span><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><input class="input" id="nameA" value="${esc(nm.a)}" maxlength="20" aria-label="First name"><input class="input" id="nameB" value="${esc(nm.b)}" maxlength="20" aria-label="Second name"></div></div>
-    <div class="field"><span class="lbl">This phone belongs to</span><div class="seg">${["a", "b"].map((w) => `<button type="button" data-action="set-me" data-who="${w}" aria-pressed="${S.me === w}">${esc(nm[w])}</button>`).join("")}</div></div>
-    <div class="field"><span class="lbl">Monthly budget <span class="hint num" id="set-total">${eur0(total)} total</span></span>
-      <div class="rows" style="padding:0 14px">${catRows}</div>
-      <p class="hint">Fixed costs (rent, bills) are left out of the daily allowance. Everything else counts toward it.</p>
-      <button class="btn alt small" data-action="add-cat" style="margin-top:4px">Add category</button></div>
-    <details class="fold"><summary>Passphrase</summary><div class="stack"><input class="input" id="newpass" type="password" autocomplete="new-password" placeholder="New passphrase (8+ characters)"><button class="btn alt small" data-action="change-pass">Change passphrase</button><p class="hint">After changing it, enter the new one on the other phone.</p></div></details>
-    <div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn alt small" data-action="export">Download CSV</button><button class="btn alt small" data-action="lock">Lock this phone</button></div>
-  </div>`);
+/* ----- settings: budget edits are a draft that the other person has to approve ----- */
+const catKeys = ["name", "icon", "monthly", "fixed", "archived", "order"];
+const sameCat = (a, b) => !!a && !!b && catKeys.every((k) => a[k] === b[k]);
+function draftChanges() {
+  const cur = catById();
+  return (S.draft || []).filter((d) => !sameCat(cur[d.id], d));
 }
 
-function whoAreYouSheet() {
-  const nm = names();
-  openSheet("Who is using this phone?", `<div class="stack"><p class="hint">So new expenses are marked as yours by default. You can change it any time in settings.</p>
-    ${["a", "b"].map((w) => `<button class="btn ${w === "b" ? "alt" : ""}" data-action="set-me" data-who="${w}" data-close="1">${esc(nm[w])}</button>`).join("")}</div>`, { dismissible: false });
+function pushState() {
+  if (!pushSupported()) return { on: false, note: "This browser can't show notifications." };
+  if (isIos() && !isStandalone()) return { on: false, note: "On iPhone, add this app to your Home Screen first (Share, then Add to Home Screen) and open it from there." };
+  if (Notification.permission === "denied") return { on: false, note: "Notifications are blocked. Allow them for this app in your phone's settings." };
+  return { on: !!S.data.pushOn, note: "" };
 }
+
+function settingsSheet() {
+  if (!S.draft) S.draft = S.data.cats.filter((c) => !c.archived).sort((a, b) => a.order - b.order).map((c) => ({ ...c }));
+  const pb = pendingBudget();
+  const locked = !!pb;
+  const rows = S.draft.filter((c) => !c.archived).map((c) => `<div class="set-cat" data-cat="${esc(c.id)}">
+      <input class="input icon-in" data-field="icon" value="${esc(c.icon)}" maxlength="4" aria-label="Icon for ${esc(c.name)}" ${locked ? "disabled" : ""}>
+      <input class="input" data-field="name" value="${esc(c.name)}" maxlength="30" aria-label="Category name" ${locked ? "disabled" : ""}>
+      <input class="input" data-field="monthly" inputmode="decimal" value="${c.monthly}" aria-label="Monthly budget for ${esc(c.name)}" ${locked ? "disabled" : ""}>
+      <div class="set-cat-foot"><label class="check"><input type="checkbox" data-field="fixed" ${c.fixed ? "checked" : ""} ${locked ? "disabled" : ""}> Fixed monthly cost</label>${locked ? "" : `<button class="link" data-action="archive-cat" data-id="${esc(c.id)}">Remove</button>`}</div></div>`).join("");
+  const total = S.draft.filter((c) => !c.archived).reduce((s, c) => s + c.monthly, 0);
+  const n = draftChanges().length;
+  const ps = pushState();
+  const users = S.data.users;
+  const waitingInvite = S.data.invites?.[0];
+  openSheet("Settings", `<div class="stack">
+    <div class="field"><span class="lbl">Your account</span>
+      <div style="display:grid;grid-template-columns:1fr auto;gap:8px"><input class="input" id="myname" value="${esc(meUser().name)}" maxlength="20" aria-label="Your name"><button class="btn alt small" data-action="save-name">Save</button></div>
+      <p class="hint">${esc(meUser().email)}${users.length < 2 && waitingInvite ? ` · Waiting for your partner (${esc(waitingInvite)}) to create their account.` : ""}</p></div>
+    <div class="field"><span class="lbl">Notifications</span>
+      ${ps.on ? `<p class="hint">On for this phone. You'll get a message when ${esc(otherName())} needs your approval or answers yours.</p><button class="btn alt small" data-action="push-off">Turn off</button>`
+        : ps.note ? `<p class="hint">${esc(ps.note)}</p>` : `<p class="hint">Get a message on this phone when ${esc(otherName())} needs your approval.</p><button class="btn alt small" data-action="push-on">Turn on notifications</button>`}</div>
+    <div class="field"><span class="lbl">Monthly budget <span class="hint num" id="set-total">${eur0(total)} total</span></span>
+      ${locked ? `<p class="note-inline">${pb.uid === meUser().id ? `Waiting for ${esc(otherName())} to approve your change. You can't edit the budget until they answer.` : `${esc(userName(pb.uid))} proposed a change. Approve or decline it at the top of the screen.`}</p>${pb.uid === meUser().id ? `<button class="btn alt small" data-action="decide" data-id="${esc(pb.id)}" data-op="cancel" data-close="1">Cancel my request</button>` : ""}` : `<p class="hint">Changes here are sent to ${esc(otherName())} and only take effect once they approve. Fixed costs (rent, bills) are left out of the daily allowance.</p>`}
+      <div class="rows" style="padding:0 14px">${rows}</div>
+      ${locked ? "" : `<button class="btn alt small" data-action="add-cat" style="margin-top:4px">Add category</button>
+      <button class="btn" id="send-budget" data-action="send-budget" ${n ? "" : "disabled"}>${n ? `Ask ${esc(otherName())} to approve ${n} ${n === 1 ? "change" : "changes"}` : "No changes yet"}</button>`}</div>
+    <details class="fold"><summary>Change password</summary><div class="stack"><input class="input" id="curpass" type="password" autocomplete="current-password" placeholder="Current password"><input class="input" id="newpass" type="password" autocomplete="new-password" placeholder="New password (8+ characters)"><button class="btn alt small" data-action="change-pass">Change password</button></div></details>
+    <div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn alt small" data-action="export">Download CSV</button><button class="btn alt small" data-action="logout">Log out</button></div>
+  </div>`);
+}
+function settingsKeepScroll() { const y = $(".sheet")?.scrollTop || 0; settingsSheet(); const s = $(".sheet"); if (s) s.scrollTop = y; }
 
 /* ============ auth screens ============ */
 function authScreen(html) { app.innerHTML = `<div class="auth">${html}</div>`; sheetRoot.innerHTML = ""; S.sheet = false; }
 
-function setupScreen() {
-  authScreen(`<div><h1>Our budget</h1><p style="margin-top:8px">Set it up once. Both of you open the same link and use the same passphrase.</p></div>
-  <form data-form="setup" class="stack" novalidate>
-    <div class="field"><label class="lbl" for="s-a">Your name</label><input class="input" id="s-a" name="nameA" maxlength="20" autocomplete="given-name" placeholder="Vihren"></div>
-    <div class="field"><label class="lbl" for="s-b">Their name</label><input class="input" id="s-b" name="nameB" maxlength="20" placeholder="Name"></div>
-    <div class="field"><label class="lbl" for="s-p">Shared passphrase</label><input class="input" id="s-p" name="passphrase" type="password" autocomplete="new-password" placeholder="At least 8 characters"></div>
-    <p class="hint">Your starter budget (€2,280 a month) is added automatically. You can change every number later.</p>
-    <p class="err" data-err></p><button class="btn" type="submit">Create our budget</button></form>`);
+function authView(view, msg = "") {
+  const st = S.status;
+  if (view === "register") {
+    const first = st.users === 0;
+    authScreen(`<div><h1>Our budget</h1><p style="margin-top:8px">${first ? "Create your account. Your partner makes theirs next, with the email you enter below." : "Create your account with the email your partner invited."}</p></div>
+    <form data-form="register" class="stack" novalidate>
+      <div class="field"><label class="lbl" for="r-n">Your name</label><input class="input" id="r-n" name="name" maxlength="20" autocomplete="given-name"></div>
+      <div class="field"><label class="lbl" for="r-e">Your email</label><input class="input" id="r-e" name="email" type="email" autocomplete="email" inputmode="email"></div>
+      <div class="field"><label class="lbl" for="r-p">Password</label><input class="input" id="r-p" name="password" type="password" autocomplete="new-password" placeholder="At least 8 characters"></div>
+      ${first ? '<div class="field"><label class="lbl" for="r-pe">Your partner\'s email</label><input class="input" id="r-pe" name="partnerEmail" type="email" inputmode="email" autocomplete="off"></div><p class="hint">Only that email address can join. Your starter budget (€2,280 a month) is added automatically.</p>' : ""}
+      <p class="err" data-err>${esc(msg)}</p><button class="btn" type="submit">Create account</button></form>
+    ${st.users > 0 ? '<button class="link" data-action="auth" data-view="login">I already have an account</button>' : ""}`);
+  } else if (view === "forgot") {
+    authScreen(`<div><h1>Reset password</h1><p style="margin-top:8px">${st.emailEnabled ? "Enter your email and we'll send you a link to choose a new password." : "Email sending isn't set up for this app yet, so reset links can't be sent."}</p></div>
+    <form data-form="forgot" class="stack" novalidate><div class="field"><label class="lbl" for="f-e">Email</label><input class="input" id="f-e" name="email" type="email" autocomplete="email" inputmode="email"></div>
+    <p class="err" data-err>${esc(msg)}</p><button class="btn" type="submit" ${st.emailEnabled ? "" : "disabled"}>Send reset link</button></form>
+    <button class="link" data-action="auth" data-view="login">Back to log in</button>`);
+  } else if (view === "reset") {
+    authScreen(`<div><h1>New password</h1><p style="margin-top:8px">Choose a new password for your account.</p></div>
+    <form data-form="reset" class="stack" novalidate><div class="field"><label class="lbl" for="n-p">New password</label><input class="input" id="n-p" name="password" type="password" autocomplete="new-password" placeholder="At least 8 characters" data-autofocus></div>
+    <p class="err" data-err>${esc(msg)}</p><button class="btn" type="submit">Save password</button></form>`);
+  } else {
+    authScreen(`<div><h1>Our budget</h1><p style="margin-top:8px">Log in to open your budget.</p></div>
+    <form data-form="login" class="stack" novalidate>
+      <div class="field"><label class="lbl" for="l-e">Email</label><input class="input" id="l-e" name="email" type="email" autocomplete="email" inputmode="email"></div>
+      <div class="field"><label class="lbl" for="l-p">Password</label><input class="input" id="l-p" name="password" type="password" autocomplete="current-password"></div>
+      <p class="err" data-err>${esc(msg)}</p><button class="btn" type="submit">Log in</button></form>
+    <div class="auth-links"><button class="link" data-action="auth" data-view="forgot">Forgot password?</button>${st.users < 2 ? '<button class="link" data-action="auth" data-view="register">Create account</button>' : ""}</div>`);
+  }
 }
 
-function loginScreen(msg = "") {
-  authScreen(`<div><h1>Our budget</h1><p style="margin-top:8px">Enter your shared passphrase to open it.</p></div>
-  <form data-form="login" class="stack" novalidate>
-    <div class="field"><label class="lbl" for="l-p">Passphrase</label><input class="input" id="l-p" name="passphrase" type="password" autocomplete="current-password" data-autofocus></div>
-    <p class="err" data-err>${esc(msg)}</p><button class="btn" type="submit">Open budget</button></form>`);
-  setTimeout(() => $("#l-p")?.focus(), 50);
+function signOutLocal() {
+  S.token = ""; localStorage.removeItem("ob.token"); S.data = null; S.lastSig = ""; S.log = null;
+  authView("login");
 }
 
-function lock() {
-  S.key = ""; localStorage.removeItem("ob.key"); S.data = null; S.lastSig = "";
-  loginScreen();
+async function afterAuth(token) {
+  S.token = token; localStorage.setItem("ob.token", token);
+  S.lastSig = ""; S.tab = "today";
+  history.replaceState(null, "", location.pathname);
+  await refresh(true);
+}
+
+/* ============ push ============ */
+const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+const isIos = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const isStandalone = () => window.navigator.standalone === true || matchMedia("(display-mode: standalone)").matches;
+const urlB64 = (b64) => { const p = "=".repeat((4 - (b64.length % 4)) % 4); const raw = atob((b64 + p).replace(/-/g, "+").replace(/_/g, "/")); return Uint8Array.from(raw, (c) => c.charCodeAt(0)); };
+
+async function enablePush() {
+  if (!pushSupported()) return toast("This browser can't show notifications.");
+  const perm = await Notification.requestPermission();
+  if (perm !== "granted") { toast("Notifications are blocked. Allow them for this app in your phone's settings."); render(); return; }
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = (await reg.pushManager.getSubscription()) || (await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64(S.data.vapidPublicKey) }));
+    await api("POST", "/push/subscribe", { subscription: sub.toJSON() });
+    await refresh(true);
+    toast("Notifications are on.");
+  } catch (e) { toast("Couldn't turn on notifications: " + (e.message || "unknown error")); }
+}
+async function disablePush() {
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) { await api("POST", "/push/unsubscribe", { endpoint: sub.endpoint }); await sub.unsubscribe(); }
+    await refresh(true);
+    toast("Notifications are off for this phone.");
+  } catch (e) { toast(e.message); }
 }
 
 /* ============ toast ============ */
 let toastTimer;
-function toast(msg, undo) {
+function toast(msg) {
   const root = $("#toast-root");
-  root.innerHTML = `<div class="toast" role="status"><span>${esc(msg)}</span>${undo ? '<button data-action="undo">Undo</button>' : ""}</div>`;
-  S.undo = undo || null;
+  root.innerHTML = `<div class="toast" role="status"><span>${esc(msg)}</span></div>`;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { root.innerHTML = ""; S.undo = null; }, undo ? 6000 : 3500);
+  toastTimer = setTimeout(() => { root.innerHTML = ""; }, 4200);
 }
 
 /* ============ actions ============ */
+async function guarded(fn) { try { await fn(); } catch (e) { toast(e.message || "Something went wrong."); await refresh(true).catch(() => {}); } }
+
 const actions = {
-  tab(el) { S.tab = el.dataset.tab; if (S.tab === "spending") { S.filterCat = "all"; S.filterWho = "all"; } window.scrollTo(0, 0); render(); },
-  add() { expenseSheet(null); },
-  settings() { settingsSheet(); },
-  "close-sheet"() { closeSheet(); },
-  month(el) {
-    const next = addMonths(S.month, Number(el.dataset.dir));
-    if (next > monthOf(todayStr())) return;
-    S.month = next; render();
+  tab(el) {
+    S.tab = el.dataset.tab;
+    if (S.tab === "spending") { S.filterCat = "all"; S.filterWho = "all"; }
+    if (S.tab === "history") { S.log = null; loadLog(); }
+    window.scrollTo(0, 0); render();
   },
+  auth(el) { authView(el.dataset.view); },
+  add() { expenseSheet(null); },
+  settings() { S.draft = null; settingsSheet(); },
+  "close-sheet"() { closeSheet(); },
+  month(el) { const next = addMonths(S.month, Number(el.dataset.dir)); if (next > monthOf(todayStr())) return; S.month = next; render(); },
   "filter-cat"(el) { S.tab = "spending"; S.month = monthOf(todayStr()); S.filterCat = el.dataset.id; S.filterWho = "all"; window.scrollTo(0, 0); render(); },
   "set-filter"(el) { if (el.dataset.kind === "cat") S.filterCat = el.dataset.id; else S.filterWho = el.dataset.id; render(); },
+  "log-who"(el) { S.logWho = el.dataset.id; render(); },
+  "log-only"() { S.logOnly = !S.logOnly; render(); },
   "pick-cat"(el) {
     const form = el.closest("form");
     form.querySelectorAll(".cat-pick").forEach((b) => b.setAttribute("aria-pressed", String(b === el)));
     form.elements.catId.value = el.dataset.id;
   },
-  "pick-who"(el) {
-    const wrap = el.closest(".seg");
-    wrap.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === el)));
-    wrap.querySelector("input").value = el.dataset.who;
-  },
-  "pick-dir"(el) {
-    const wrap = el.closest(".seg");
-    wrap.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === el)));
-    wrap.querySelector("input").value = el.dataset.dir;
-  },
+  "pick-who"(el) { const w = el.closest(".seg"); w.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === el))); w.querySelector("input").value = el.dataset.who; },
+  "pick-dir"(el) { const w = el.closest(".seg"); w.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === el))); w.querySelector("input").value = el.dataset.dir; },
   "edit-expense"(el) { const e = S.data.expenses.find((x) => x.id === el.dataset.id); if (e) expenseSheet(e); },
-  "delete-expense"(el) {
-    const form = el.closest("form");
-    const id = form.dataset.id, month = form.dataset.month;
-    const old = S.data.expenses.find((x) => x.id === id);
+
+  "ask-delete"(el) {
+    const who = otherName();
+    if (!confirm(`Ask ${who} to approve deleting this expense? It stays in the budget until they approve.`)) return;
     closeSheetQuiet();
-    mutate(() => { S.data.expenses = S.data.expenses.filter((x) => x.id !== id); }, () => api("DELETE", `/expense/${month}/${id}`));
-    toast("Expense deleted", () => saveExpense(old));
+    guarded(async () => {
+      await api("POST", "/expense/delete-request", { id: el.dataset.id, month: el.dataset.month });
+      await refresh(true);
+      toast(`Sent to ${who}. It's deleted once they approve.`);
+    });
   },
+  decide(el) {
+    const { id, op } = el.dataset;
+    if (el.dataset.close) closeSheetQuiet();
+    guarded(async () => {
+      await api("POST", `/request/${id}/${op}`);
+      await refresh(true);
+      toast(op === "approve" ? "Approved." : op === "decline" ? "Declined. Nothing was changed." : "Request cancelled.");
+    });
+  },
+  "dismiss-notices"() { localStorage.setItem("ob.seen", String(Date.now())); render(); },
+
   "new-goal"() { goalSheet(null); },
   "edit-goal"(el) { goalSheet(S.data.goals.find((g) => g.id === el.dataset.id)); },
   "delete-goal"(el) {
     const id = el.closest("form").dataset.id;
-    if (!confirm("Delete this goal and all the money logged to it?")) return;
+    if (!confirm("Delete this goal and all the money logged to it? This is recorded in History.")) return;
     closeSheetQuiet();
     mutate(() => { S.data.goals = S.data.goals.filter((g) => g.id !== id); S.data.contribs = S.data.contribs.filter((c) => c.goalId !== id); }, () => api("DELETE", `/goal/${id}`));
   },
@@ -560,65 +803,77 @@ const actions = {
     closeSheetQuiet();
     mutate(() => { S.data.contribs = S.data.contribs.filter((c) => c.id !== id); }, () => api("DELETE", `/contrib/${goalId}/${id}`));
   },
-  "set-me"(el) {
-    S.me = el.dataset.who; localStorage.setItem("ob.me", S.me);
-    if (el.dataset.close) closeSheet(); else { settingsSheetKeepScroll(); }
+
+  "save-name"() {
+    const name = $("#myname").value.trim();
+    if (!name) return;
+    guarded(async () => { await api("PUT", "/me", { name }); await refresh(true); toast("Name saved."); settingsKeepScroll(); });
   },
   "add-cat"() {
-    const order = Math.max(-1, ...S.data.cats.map((c) => c.order)) + 1;
-    const c = { id: "c-" + uid().slice(0, 10), name: "New category", icon: "🛍️", monthly: 0, fixed: false, archived: false, order };
-    mutate(() => S.data.cats.push(c), () => api("PUT", "/cat", c));
-    settingsSheetKeepScroll();
+    const order = Math.max(-1, ...S.draft.map((c) => c.order), ...S.data.cats.map((c) => c.order)) + 1;
+    S.draft.push({ id: "c-" + uid().slice(0, 10), name: "New category", icon: "🛍️", monthly: 0, fixed: false, archived: false, order });
+    settingsKeepScroll();
   },
   "archive-cat"(el) {
-    const c = S.data.cats.find((x) => x.id === el.dataset.id);
-    if (!c || !confirm(`Remove "${c.name}"? Past expenses in it stay in your history.`)) return;
+    const c = S.draft.find((x) => x.id === el.dataset.id);
+    if (!c || !confirm(`Remove "${c.name}"? Past expenses in it stay in your history. ${otherName()} will need to approve this.`)) return;
     c.archived = true;
-    mutate(() => {}, () => api("PUT", "/cat", c));
-    settingsSheetKeepScroll();
+    // a brand-new category that was never sent can simply disappear
+    if (!catById()[c.id]) S.draft = S.draft.filter((x) => x.id !== c.id);
+    settingsKeepScroll();
   },
+  "send-budget"() {
+    const changes = draftChanges();
+    if (!changes.length) return;
+    guarded(async () => {
+      await api("POST", "/budget/request", { changes });
+      closeSheetQuiet();
+      await refresh(true);
+      toast(`Sent to ${otherName()}. It changes once they approve.`);
+    });
+  },
+  "push-on"() { enablePush().then(() => { if (S.sheet) settingsKeepScroll(); }); },
+  "push-off"() { disablePush().then(() => { if (S.sheet) settingsKeepScroll(); }); },
+  "push-no"() { localStorage.setItem("ob.pushno", "1"); render(); },
   async "change-pass"() {
-    const v = $("#newpass").value;
-    if (v.length < 8) { toast("Use at least 8 characters."); return; }
-    try { await api("POST", "/passphrase", { passphrase: v }); S.key = v; localStorage.setItem("ob.key", v); toast("Passphrase changed. Use the new one on the other phone."); $("#newpass").value = ""; }
+    const cur = $("#curpass").value, next = $("#newpass").value;
+    if (next.length < 8) return toast("Use at least 8 characters.");
+    try { await api("POST", "/password", { current: cur, password: next }); $("#curpass").value = ""; $("#newpass").value = ""; toast("Password changed. Your partner's other devices aren't affected."); }
     catch (e) { toast(e.message); }
   },
   export() {
     const byId = catById(); const nm = names();
-    const rows = [["Date", "Category", "Amount (EUR)", "Paid by", "Note"]].concat(
-      S.data.expenses.slice().sort((a, b) => (a.date < b.date ? -1 : 1)).map((e) => [e.date, byId[e.catId]?.name || "", e.amount.toFixed(2), nm[e.who], e.note]));
+    const rows = [["Date", "Category", "Amount (EUR)", "Paid by", "Added by", "Note"]].concat(
+      S.data.expenses.slice().sort((a, b) => (a.date < b.date ? -1 : 1)).map((e) => [e.date, byId[e.catId]?.name || "", e.amount.toFixed(2), nm[e.who], nm[e.by], e.note]));
     const csv = "﻿" + rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
     a.download = `our-budget-${todayStr()}.csv`; a.click(); URL.revokeObjectURL(a.href);
   },
-  lock() { closeSheetQuiet(); lock(); },
-  undo() { const u = S.undo; $("#toast-root").innerHTML = ""; S.undo = null; if (u) u(); },
+  async logout() { closeSheetQuiet(); try { await api("POST", "/logout"); } catch {} signOutLocal(); },
 };
-
-function closeSheetQuiet() { S.sheet = false; sheetRoot.innerHTML = ""; }
-function settingsSheetKeepScroll() { const y = $(".sheet")?.scrollTop || 0; settingsSheet(); const s = $(".sheet"); if (s) s.scrollTop = y; }
-
-function saveExpense(rec) {
-  mutate(() => { S.data.expenses = S.data.expenses.filter((x) => x.id !== rec.id).concat(rec); }, () => api("PUT", "/expense", rec));
-}
 
 /* ============ forms ============ */
 const forms = {
-  async setup(f) {
+  async register(f) {
     const v = Object.fromEntries(new FormData(f));
-    if (!v.passphrase || v.passphrase.length < 8) return formErr(f, "Use at least 8 characters for the passphrase.");
-    try {
-      await api("POST", "/setup", v);
-      S.key = v.passphrase; localStorage.setItem("ob.key", S.key);
-      await boot();
-    } catch (e) { formErr(f, e.message); }
+    try { const r = await api("POST", "/register", v); await afterAuth(r.token); }
+    catch (e) { formErr(f, e.message); }
   },
   async login(f) {
-    const pass = new FormData(f).get("passphrase");
-    S.key = pass;
-    try { await refresh(true); localStorage.setItem("ob.key", pass); S.lastSig = ""; await boot(); }
-    catch (e) { S.key = ""; formErr(f, e.status === 401 || /passphrase/i.test(e.message) ? "That passphrase didn't work." : e.message); }
+    const v = Object.fromEntries(new FormData(f));
+    try { const r = await api("POST", "/login", v); await afterAuth(r.token); }
+    catch (e) { formErr(f, e.message); }
+  },
+  async forgot(f) {
+    const v = Object.fromEntries(new FormData(f));
+    try { await api("POST", "/forgot", v); f.innerHTML = '<p>If that email has an account, a reset link is on its way. It works for one hour.</p><button class="link" type="button" data-action="auth" data-view="login">Back to log in</button>'; }
+    catch (e) { formErr(f, e.message); }
+  },
+  async reset(f) {
+    const v = Object.fromEntries(new FormData(f));
+    try { const r = await api("POST", "/reset", { token: S.resetToken, password: v.password }); S.resetToken = ""; await afterAuth(r.token); toast("Password changed. You're logged in."); }
+    catch (e) { formErr(f, e.message); }
   },
   expense(f) {
     const v = Object.fromEntries(new FormData(f));
@@ -627,16 +882,14 @@ const forms = {
     if (!v.catId) return formErr(f, "Pick a category.");
     if (!v.date) return formErr(f, "Pick a date.");
     const editing = !!f.dataset.id;
-    const rec = { id: f.dataset.id || uid(), catId: v.catId, amount, note: (v.note || "").trim(), who: v.who, date: v.date, ts: Date.now() };
+    const old = editing ? S.data.expenses.find((x) => x.id === f.dataset.id) : null;
+    const rec = { id: f.dataset.id || uid(), catId: v.catId, amount, note: (v.note || "").trim(), who: v.who, date: v.date, by: old?.by ?? mySlot(), ts: old?.ts ?? Date.now() };
     const oldMonth = f.dataset.month;
     closeSheetQuiet();
     S.lastCat = v.catId; localStorage.setItem("ob.lastcat", S.lastCat);
     mutate(() => { S.data.expenses = S.data.expenses.filter((x) => x.id !== rec.id).concat(rec); },
-      async () => { await api("PUT", "/expense", rec); if (editing && oldMonth && oldMonth !== monthOf(rec.date)) await api("DELETE", `/expense/${oldMonth}/${rec.id}`); });
-    const c = catById()[rec.catId];
-    if (!editing) toast(`Added ${eur(amount)} · ${c?.name || ""}`, () => {
-      mutate(() => { S.data.expenses = S.data.expenses.filter((x) => x.id !== rec.id); }, () => api("DELETE", `/expense/${monthOf(rec.date)}/${rec.id}`));
-    });
+      () => api("PUT", "/expense", { ...rec, oldMonth }));
+    toast(editing ? "Saved. The change is recorded in History." : `Added ${eur(amount)} · ${catName(rec.catId)}`);
   },
   goal(f) {
     const v = Object.fromEntries(new FormData(f));
@@ -652,7 +905,7 @@ const forms = {
     const v = Object.fromEntries(new FormData(f));
     const amt = parseAmount(v.amount);
     if (!(amt > 0)) return formErr(f, "Enter an amount greater than 0.");
-    const rec = { id: f.dataset.id || uid(), goalId: f.dataset.goal, amount: amt * Number(v.dir), who: v.who, date: v.date || todayStr(), note: (v.note || "").trim() };
+    const rec = { id: f.dataset.id || uid(), goalId: f.dataset.goal, amount: amt * Number(v.dir), who: v.who, date: v.date || todayStr(), note: (v.note || "").trim(), by: mySlot() };
     closeSheetQuiet();
     mutate(() => { S.data.contribs = S.data.contribs.filter((c) => c.id !== rec.id).concat(rec); }, () => api("PUT", "/contrib", rec));
     toast(rec.amount > 0 ? `Added ${eur(rec.amount)} to the goal` : `Took out ${eur(-rec.amount)}`);
@@ -675,33 +928,27 @@ document.addEventListener("submit", (ev) => {
 });
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && S.sheet && $(".scrim[data-action]")) closeSheet(); });
 
-// settings: names + category edits save as you type/leave a field
-document.addEventListener("change", (ev) => {
+// budget draft: typing changes the draft only; nothing is saved until the other person approves
+document.addEventListener("input", (ev) => {
   const t = ev.target;
-  if (t.id === "nameA" || t.id === "nameB") {
-    const a = $("#nameA").value.trim(), b = $("#nameB").value.trim();
-    if (!a || !b) return;
-    mutate(() => { S.data.meta.names = { a, b }; }, () => api("PUT", "/meta", { nameA: a, nameB: b }));
-    return;
-  }
   const row = t.closest?.(".set-cat");
-  if (row && t.dataset.field) {
-    const c = S.data.cats.find((x) => x.id === row.dataset.cat);
-    if (!c) return;
-    if (t.dataset.field === "monthly") { const n = parseAmount(t.value); if (!(n >= 0)) { t.value = c.monthly; return; } c.monthly = n; t.value = n; }
-    else if (t.dataset.field === "fixed") c.fixed = t.checked;
-    else { const v = t.value.trim(); if (!v) { t.value = c[t.dataset.field]; return; } c[t.dataset.field] = v; }
-    S.lastSig = "";
-    api("PUT", "/cat", c).catch((e) => toast(e.message));
-    const total = activeCats().reduce((s, x) => s + x.monthly, 0);
-    const tot = $("#set-total"); if (tot) tot.textContent = `${eur0(total)} total`;
-  }
+  if (!row || !t.dataset.field || !S.draft) return;
+  const c = S.draft.find((x) => x.id === row.dataset.cat);
+  if (!c) return;
+  if (t.dataset.field === "monthly") { const n = parseAmount(t.value); if (!(n >= 0)) return; c.monthly = n; }
+  else if (t.dataset.field === "fixed") c.fixed = t.checked;
+  else c[t.dataset.field] = t.value.trim() || c[t.dataset.field];
+  const total = S.draft.filter((x) => !x.archived).reduce((s, x) => s + x.monthly, 0);
+  const tot = $("#set-total"); if (tot) tot.textContent = `${eur0(total)} total`;
+  const n = draftChanges().length;
+  const btn = $("#send-budget");
+  if (btn) { btn.disabled = !n; btn.textContent = n ? `Ask ${otherName()} to approve ${n} ${n === 1 ? "change" : "changes"}` : "No changes yet"; }
 });
 
 // chart tooltip
 function showTip(el) {
-  const chart = el.closest(".chart"); const tip = $(".tip", chart); const svg = $("svg", chart);
-  const r = svg.getBoundingClientRect(); const vb = svg.viewBox.baseVal;
+  const chart = el.closest(".chart"); const tip = $(".tip", chart); const sv = $("svg", chart);
+  const r = sv.getBoundingClientRect(); const vb = sv.viewBox.baseVal;
   tip.textContent = el.dataset.tip; tip.hidden = false;
   const cx = (Number(el.dataset.tx) / vb.width) * r.width;
   const half = tip.offsetWidth / 2;
@@ -714,18 +961,26 @@ document.addEventListener("pointerout", (ev) => { if (ev.target.closest?.(".hit"
 
 /* ============ boot ============ */
 async function boot() {
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("/sw.js").catch(() => {});
+    navigator.serviceWorker.addEventListener("message", (ev) => { if (ev.data?.type === "refresh" && S.token) refresh(true).catch(() => {}); });
+  }
   try {
-    const status = await fetch("/api/status").then((r) => r.json());
-    if (!status.configured) return setupScreen();
-    if (!S.key) return loginScreen();
+    S.status = await fetch("/api/status").then((r) => r.json());
+    const m = /^#reset=([a-f0-9]{48})$/.exec(location.hash);
+    if (m) { S.resetToken = m[1]; return authView("reset"); }
+    if (!S.token) return authView(S.status.users === 0 ? "register" : "login");
     await refresh(true);
-    if (!S.me) whoAreYouSheet();
   } catch (e) {
-    if (S.key && e.status === 401) return loginScreen("Enter your passphrase again.");
+    if (e.status === 401 || !S.data) { if (e.status === 401) { S.token = ""; localStorage.removeItem("ob.token"); return authView("login"); } }
     app.innerHTML = `<div class="auth"><h1>Can't connect</h1><p>${esc(e.message || "Check your connection and try again.")}</p><button class="btn" onclick="location.reload()">Try again</button></div>`;
   }
 }
 
-setInterval(() => { if (S.data && !document.hidden && S.key) refresh().catch(() => {}); }, 20000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden && S.data && S.key) refresh().catch(() => {}); });
+setInterval(() => {
+  if (!S.data || document.hidden || !S.token) return;
+  refresh().catch(() => {});
+  if (S.tab === "history") loadLog(true);
+}, 20000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden && S.data && S.token) { refresh().catch(() => {}); if (S.tab === "history") loadLog(true); } });
 boot();
