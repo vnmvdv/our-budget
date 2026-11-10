@@ -1,0 +1,14 @@
+{
+  "name": "our-budget",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared monthly budget app for two",
+  "scripts": {
+    "test": "node --experimental-strip-types test/api.test.mts"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^8.1.0",
+    "@netlify/functions": "^3.0.0"
+  }
+}
