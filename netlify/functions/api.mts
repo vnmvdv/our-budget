@@ -67,12 +67,33 @@ async function newSession(store: Db, uid: string) {
   await store.setJSON(`session/${sha(token)}`, { uid, exp: Date.now() + 180 * 864e5 });
   return token;
 }
+/* Open mode: no login. The device says who it is (Vihren or Victoria) and the server trusts it.
+   Switch back to real logins by setting the OPEN_MODE environment variable to 0 (or flipping the default below). */
+const OPEN_MODE_DEFAULT = true;
+const openMode = () => (env("OPEN_MODE") ?? (OPEN_MODE_DEFAULT ? "1" : "0")) !== "0";
+const OPEN_NAMES: Record<string, string> = { a: "Vihren", b: "Victoria" };
+async function openUser(store: Db, slot: string) {
+  const ks = await keysOf(store, "user/");
+  const all = await getMany(store, ks);
+  const found = all.find((u) => u.slot === slot);
+  if (found) return found;
+  const u = { id: "u-open-" + slot, slot, name: OPEN_NAMES[slot], email: "", created: Date.now() };
+  await store.setJSON(`user/${u.id}`, u);
+  if (!(await keysOf(store, "cat/")).length)
+    await Promise.all(STARTER.map(([id, nm, icon, monthly, fixed], i) => store.setJSON(`cat/${id}`, { id, name: nm, icon, monthly, fixed, archived: false, order: i })));
+  return u;
+}
 async function userFromRequest(req: Request, store: Db) {
   const m = /^Bearer ([a-f0-9]{64})$/.exec(req.headers.get("authorization") ?? "");
-  if (!m) return null;
-  const s = await store.get(`session/${sha(m[1])}`, { type: "json" });
-  if (!s || s.exp < Date.now()) return null;
-  return (await store.get(`user/${s.uid}`, { type: "json" })) ?? null;
+  if (m) {
+    const s = await store.get(`session/${sha(m[1])}`, { type: "json" });
+    if (s && s.exp >= Date.now()) return (await store.get(`user/${s.uid}`, { type: "json" })) ?? null;
+  }
+  if (openMode()) {
+    const who = req.headers.get("x-open-who");
+    if (who === "a" || who === "b") return openUser(store, who);
+  }
+  return null;
 }
 async function dropSessions(store: Db, uid: string, keep?: string) {
   const keys = await keysOf(store, "session/");
@@ -202,7 +223,7 @@ export default async (req: Request, _ctx: Context) => {
     /* ----- public routes ----- */
     if (route === "status" && method === "GET") {
       const users = await keysOf(store, "user/");
-      return json({ users: users.length, emailEnabled: mailEnabled(), recoveryEnabled: recoveryKey().length >= 12 });
+      return json({ users: users.length, emailEnabled: mailEnabled(), recoveryEnabled: recoveryKey().length >= 12, ...(openMode() ? { open: true, names: { a: (await getMany(store, await keysOf(store, "user/"))).find((u) => u.slot === "a")?.name ?? OPEN_NAMES.a, b: (await getMany(store, await keysOf(store, "user/"))).find((u) => u.slot === "b")?.name ?? OPEN_NAMES.b } } : {}) });
     }
 
     if (route === "register" && method === "POST") {

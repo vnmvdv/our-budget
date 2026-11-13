@@ -38,6 +38,7 @@ const eur0 = (n) => `${n < -0.5 ? "−" : ""}€${Math.abs(Math.round(n)).toLoca
 /* ============ state ============ */
 const S = {
   token: localStorage.getItem("ob.token") || "",
+  who: localStorage.getItem("ob.who") || "",
   data: null,
   status: { users: 0, emailEnabled: false },
   tab: "today",
@@ -82,11 +83,11 @@ const decidedNotices = () => {
 async function api(method, path, body) {
   const res = await fetch("/api" + path, {
     method,
-    headers: { "content-type": "application/json", ...(S.token ? { authorization: `Bearer ${S.token}` } : {}) },
+    headers: { "content-type": "application/json", ...(S.token && !S.status.open ? { authorization: `Bearer ${S.token}` } : {}), ...(S.status.open && S.who ? { "x-open-who": S.who } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401 && S.token && S.data) { signOutLocal(); throw Object.assign(new Error("Please log in again."), { status: 401 }); }
+  if (res.status === 401 && S.token && S.data && !S.status.open) { signOutLocal(); throw Object.assign(new Error("Please log in again."), { status: 401 }); }
   if (!res.ok) throw Object.assign(new Error(data.error || "Request failed"), { status: res.status });
   return data;
 }
@@ -640,7 +641,7 @@ function settingsSheet() {
   openSheet("Settings", `<div class="stack">
     <div class="field"><span class="lbl">Your account</span>
       <div style="display:grid;grid-template-columns:1fr auto;gap:8px"><input class="input" id="myname" value="${esc(meUser().name)}" maxlength="20" aria-label="Your name"><button class="btn alt small" data-action="save-name">Save</button></div>
-      <p class="hint">${esc(meUser().email)}${users.length < 2 && waitingInvite ? ` · Waiting for your partner (${esc(waitingInvite)}) to create their account.` : ""}</p></div>
+      <p class="hint">${S.status.open ? "Open mode: no password" : esc(meUser().email)}${users.length < 2 && waitingInvite ? ` · Waiting for your partner (${esc(waitingInvite)}) to create their account.` : ""}</p></div>
     <div class="field"><span class="lbl">Notifications</span>
       ${ps.on ? `<p class="hint">On for this phone. You'll get a message when ${esc(otherName())} needs your approval or answers yours.</p><button class="btn alt small" data-action="push-off">Turn off</button>`
         : ps.note ? `<p class="hint">${esc(ps.note)}</p>` : `<p class="hint">Get a message on this phone when ${esc(otherName())} needs your approval.</p><button class="btn alt small" data-action="push-on">Turn on notifications</button>`}</div>
@@ -649,8 +650,8 @@ function settingsSheet() {
       <div class="rows" style="padding:0 14px">${rows}</div>
       ${locked ? "" : `<button class="btn alt small" data-action="add-cat" style="margin-top:4px">Add category</button>
       <button class="btn" id="send-budget" data-action="send-budget" ${n ? "" : "disabled"}>${n ? `Ask ${esc(otherName())} to approve ${n} ${n === 1 ? "change" : "changes"}` : "No changes yet"}</button>`}</div>
-    <details class="fold"><summary>Change password</summary><div class="stack"><input class="input" id="curpass" type="password" autocomplete="current-password" placeholder="Current password"><input class="input" id="newpass" type="password" autocomplete="new-password" placeholder="New password (8+ characters)"><button class="btn alt small" data-action="change-pass">Change password</button></div></details>
-    <div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn alt small" data-action="export">Download CSV</button><button class="btn alt small" data-action="logout">Log out</button></div>
+    ${S.status.open ? "" : `<details class="fold"><summary>Change password</summary><div class="stack"><input class="input" id="curpass" type="password" autocomplete="current-password" placeholder="Current password"><input class="input" id="newpass" type="password" autocomplete="new-password" placeholder="New password (8+ characters)"><button class="btn alt small" data-action="change-pass">Change password</button></div></details>`}
+    <div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn alt small" data-action="export">Download CSV</button>${S.status.open ? '<button class="btn alt small" data-action="switch-me">Switch person</button>' : '<button class="btn alt small" data-action="logout">Log out</button>'}</div>
   </div>`);
 }
 function settingsKeepScroll() { const y = $(".sheet")?.scrollTop || 0; settingsSheet(); const s = $(".sheet"); if (s) s.scrollTop = y; }
@@ -695,6 +696,13 @@ function authView(view, msg = "") {
       <p class="err" data-err>${esc(msg)}</p><button class="btn" type="submit">Log in</button></form>
     <div class="auth-links"><button class="link" data-action="auth" data-view="forgot">Forgot password?</button>${st.users < 2 ? '<button class="link" data-action="auth" data-view="register">Create account</button>' : ""}</div>`);
   }
+}
+
+function whoView() {
+  const n = S.status.names || { a: "Vihren", b: "Victoria" };
+  authScreen(`<div><h1>Our budget</h1><p style="margin-top:8px">Who is using this phone?</p></div>
+    <div class="stack"><button class="btn" data-action="pick-me" data-who="a">${esc(n.a)}</button><button class="btn alt" data-action="pick-me" data-who="b">${esc(n.b)}</button></div>
+    <p class="hint">There is no password for now. Anyone with the link can open the budget.</p>`);
 }
 
 function signOutLocal() {
@@ -757,6 +765,8 @@ const actions = {
     window.scrollTo(0, 0); render();
   },
   auth(el) { authView(el.dataset.view); },
+  async "pick-me"(el) { S.who = el.dataset.who; localStorage.setItem("ob.who", S.who); S.lastSig = ""; S.tab = "today"; try { await refresh(true); } catch (e) { toast(e.message); } },
+  "switch-me"() { closeSheetQuiet(); S.who = ""; localStorage.removeItem("ob.who"); S.data = null; S.lastSig = ""; S.log = null; whoView(); },
   add() { expenseSheet(null); },
   settings() { S.draft = null; settingsSheet(); },
   "close-sheet"() { closeSheet(); },
@@ -976,12 +986,16 @@ document.addEventListener("pointerout", (ev) => { if (ev.target.closest?.(".hit"
 async function boot() {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
-    navigator.serviceWorker.addEventListener("message", (ev) => { if (ev.data?.type === "refresh" && S.token) refresh(true).catch(() => {}); });
+    navigator.serviceWorker.addEventListener("message", (ev) => { if (ev.data?.type === "refresh" && (S.token || S.who)) refresh(true).catch(() => {}); });
   }
   try {
     S.status = await fetch("/api/status").then((r) => r.json());
     const m = /^#reset=([a-f0-9]{48})$/.exec(location.hash);
     if (m) { S.resetToken = m[1]; return authView("reset"); }
+    if (S.status.open && !m) {
+      if (!S.who) return whoView();
+      return await refresh(true);
+    }
     if (!S.token) return authView(S.status.users === 0 ? "register" : "login");
     await refresh(true);
   } catch (e) {
@@ -991,9 +1005,9 @@ async function boot() {
 }
 
 setInterval(() => {
-  if (!S.data || document.hidden || !S.token) return;
+  if (!S.data || document.hidden || !(S.token || S.who)) return;
   refresh().catch(() => {});
   if (S.tab === "history") loadLog(true);
 }, 20000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden && S.data && S.token) { refresh().catch(() => {}); if (S.tab === "history") loadLog(true); } });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && S.data && (S.token || S.who)) { refresh().catch(() => {}); if (S.tab === "history") loadLog(true); } });
 boot();

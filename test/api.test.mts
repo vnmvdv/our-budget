@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+process.env.OPEN_MODE = "0"; // tests cover the login rules; open mode has its own test below
 
 const mem = new Map<string, string>();
 (globalThis as any).__BUDGET_STORE = {
@@ -16,6 +17,11 @@ async function call(method: string, path: string, body?: unknown, token: string 
   const headers: Record<string, string> = {};
   if (token) headers.authorization = `Bearer ${token}`;
   const r = await api(new Request(`https://x.test${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) }), {} as any);
+  return { status: r.status, data: await r.json() as any };
+}
+
+async function rawCall(method: string, path: string, headers: Record<string, string>) {
+  const r = await api(new Request(`https://x.test${path}`, { method, headers }), {} as any);
   return { status: r.status, data: await r.json() as any };
 }
 
@@ -154,4 +160,13 @@ assert.equal((await call("POST", "/api/push/subscribe", { subscription: { endpoi
 r = await call("GET", "/api/state", undefined, V); assert.equal(r.data.pushOn, true); assert.equal(r.data.me.name, "Vihren D");
 assert.equal((await call("POST", "/api/logout", undefined, V)).status, 200);
 assert.equal((await call("GET", "/api/state", undefined, V)).status, 401);
+/* ---- open mode (no login) ---- */
+process.env.OPEN_MODE = "1";
+assert.equal((await call("GET", "/api/state")).status, 401, "still needs to say who you are");
+const OA = { "x-open-who": "a" }, OB = { "x-open-who": "b" };
+r = await rawCall("GET", "/api/state", OA); assert.equal(r.status, 200); assert.equal(r.data.me.slot, "a");
+assert.equal((await rawCall("GET", "/api/state", { "x-open-who": "c" })).status, 401);
+process.env.OPEN_MODE = "0";
+assert.equal((await rawCall("GET", "/api/state", OA)).status, 401, "closed again when switched off");
+
 console.log("all API tests passed");
