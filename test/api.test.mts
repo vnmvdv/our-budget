@@ -130,6 +130,19 @@ assert.equal((await call("POST", "/api/reset", { token, password: "new-password-
 assert.equal((await call("GET", "/api/state", undefined, G)).status, 401, "old sessions end after a reset");
 assert.equal((await call("POST", "/api/login", { email: "g@x.com", password: "new-password-1" })).status, 200);
 
+/* ---- recovery key (no-email fallback) ---- */
+assert.equal((await call("GET", "/api/status")).data.recoveryEnabled, false);
+assert.equal((await call("POST", "/api/recover", { email: "g@x.com", key: "", password: "recovered-pass-1" })).status, 401, "no key configured = disabled");
+process.env.RECOVERY_KEY = "a-long-secret-key-123";
+assert.equal((await call("GET", "/api/status")).data.recoveryEnabled, true);
+assert.equal((await call("POST", "/api/recover", { email: "g@x.com", key: "wrong-key-wrong-key", password: "recovered-pass-1" })).status, 401);
+assert.equal((await call("POST", "/api/recover", { email: "nobody@x.com", key: "a-long-secret-key-123", password: "recovered-pass-1" })).status, 401);
+r = await call("POST", "/api/recover", { email: "g@x.com", key: "a-long-secret-key-123", password: "recovered-pass-1" }); assert.equal(r.status, 200); assert.ok(r.data.token);
+assert.equal((await call("POST", "/api/login", { email: "g@x.com", password: "recovered-pass-1" })).status, 200);
+for (let i = 0; i < 5; i++) await call("POST", "/api/recover", { email: "g@x.com", key: "bad-bad-bad-bad", password: "recovered-pass-1" });
+assert.equal((await call("POST", "/api/recover", { email: "g@x.com", key: "a-long-secret-key-123", password: "recovered-pass-1" })).status, 429, "guessing is rate limited");
+delete process.env.RECOVERY_KEY;
+
 /* ---- change password, name, push subscription ---- */
 assert.equal((await call("POST", "/api/password", { current: "wrong", password: "another-pass-1" }, V)).status, 403);
 assert.equal((await call("POST", "/api/password", { current: "vihren-pass-1", password: "another-pass-1" }, V)).status, 200);

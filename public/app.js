@@ -462,7 +462,7 @@ function logLine(e) {
   switch (e.type) {
     case "user.register": return [`${n} created their account`, ""];
     case "user.name": return [`${n} changed their name`, `${d.from} → ${d.to}`];
-    case "user.password": return [`${n} ${d.how === "reset-link" ? "reset" : "changed"} their password`, ""];
+    case "user.password": return [`${n} ${d.how ? "reset" : "changed"} their password`, ""];
     case "expense.add": return [`${n} added ${expLabel(d.exp)}`, `Paid by ${nm[d.exp.who]} · ${dayLabel(d.exp.date)}`];
     case "expense.edit": return [`${n} edited an expense`, `${expLabel(d.before)}: ${diffExp(d.before, d.after)}`];
     case "expense.delete.request": return [`${n} asked to delete ${expLabel(d.exp)}`, `Added by ${nm[d.exp.by]} on ${dayLabel(d.exp.date)}`];
@@ -674,6 +674,14 @@ function authView(view, msg = "") {
     authScreen(`<div><h1>Reset password</h1><p style="margin-top:8px">${st.emailEnabled ? "Enter your email and we'll send you a link to choose a new password." : "Email sending isn't set up for this app yet, so reset links can't be sent."}</p></div>
     <form data-form="forgot" class="stack" novalidate><div class="field"><label class="lbl" for="f-e">Email</label><input class="input" id="f-e" name="email" type="email" autocomplete="email" inputmode="email"></div>
     <p class="err" data-err>${esc(msg)}</p><button class="btn" type="submit" ${st.emailEnabled ? "" : "disabled"}>Send reset link</button></form>
+    <div class="auth-links"><button class="link" data-action="auth" data-view="login">Back to log in</button>${st.recoveryEnabled ? '<button class="link" data-action="auth" data-view="recover">I have a recovery key</button>' : ""}</div>`);
+  } else if (view === "recover") {
+    authScreen(`<div><h1>Recovery key</h1><p style="margin-top:8px">Enter your email, the RECOVERY_KEY you set in Netlify, and a new password.</p></div>
+    <form data-form="recover" class="stack" novalidate>
+      <div class="field"><label class="lbl" for="k-e">Email</label><input class="input" id="k-e" name="email" type="email" autocomplete="email" inputmode="email"></div>
+      <div class="field"><label class="lbl" for="k-k">Recovery key</label><input class="input" id="k-k" name="key" type="password" autocomplete="off"></div>
+      <div class="field"><label class="lbl" for="k-p">New password</label><input class="input" id="k-p" name="password" type="password" autocomplete="new-password" placeholder="At least 8 characters"></div>
+      <p class="err" data-err>${esc(msg)}</p><button class="btn" type="submit">Set new password</button></form>
     <button class="link" data-action="auth" data-view="login">Back to log in</button>`);
   } else if (view === "reset") {
     authScreen(`<div><h1>New password</h1><p style="margin-top:8px">Choose a new password for your account.</p></div>
@@ -868,6 +876,11 @@ const forms = {
   async forgot(f) {
     const v = Object.fromEntries(new FormData(f));
     try { await api("POST", "/forgot", v); f.innerHTML = '<p>If that email has an account, a reset link is on its way. It works for one hour.</p><button class="link" type="button" data-action="auth" data-view="login">Back to log in</button>'; }
+    catch (e) { formErr(f, e.message); }
+  },
+  async recover(f) {
+    const v = Object.fromEntries(new FormData(f));
+    try { const r = await api("POST", "/recover", v); await afterAuth(r.token); toast("Password changed. You're logged in."); }
     catch (e) { formErr(f, e.message); }
   },
   async reset(f) {

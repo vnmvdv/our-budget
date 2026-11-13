@@ -87,6 +87,8 @@ async function log(store: Db, uid: string, type: string, data: unknown) {
   await store.setJSON(`log/${id}`, { id, ts, uid, type, data });
 }
 
+const recoveryKey = () => env("RECOVERY_KEY") ?? "";
+
 /* ---------- email + push (both overridable in tests) ---------- */
 const mailEnabled = () => !!((globalThis as any).__BUDGET_MAIL || (env("SMTP_HOST") && env("SMTP_USER") && env("SMTP_PASS")));
 async function sendMail(to: string, subject: string, text: string) {
@@ -200,7 +202,7 @@ export default async (req: Request, _ctx: Context) => {
     /* ----- public routes ----- */
     if (route === "status" && method === "GET") {
       const users = await keysOf(store, "user/");
-      return json({ users: users.length, emailEnabled: mailEnabled() });
+      return json({ users: users.length, emailEnabled: mailEnabled(), recoveryEnabled: recoveryKey().length >= 12 });
     }
 
     if (route === "register" && method === "POST") {
@@ -278,6 +280,30 @@ export default async (req: Request, _ctx: Context) => {
       await store.delete(`reset/${sha(token)}`);
       await dropSessions(store, user.id);
       await log(store, user.id, "user.password", { how: "reset-link" });
+      return json({ token: await newSession(store, user.id), user: publicUser(user) });
+    }
+
+    if (route === "recover" && method === "POST") {
+      // Fallback when email isn't set up: a secret RECOVERY_KEY set in Netlify lets you choose a new password.
+      const b = await readBody(req);
+      const email = normEmail(b.email);
+      const key = recoveryKey();
+      const failKey = `fail/rec-${sha(email)}`;
+      const f = (await store.get(failKey, { type: "json" })) ?? { count: 0, until: 0 };
+      if (f.until > Date.now()) return fail(429, "Too many tries. Wait 15 minutes, then try again.");
+      if (!pwOk(b.password)) return fail(400, "Use at least 8 characters for the password.");
+      const given = typeof b.key === "string" ? b.key.slice(0, 200) : "";
+      const ref = await store.get(`email/${sha(email)}`, { type: "json" });
+      const user = ref ? await store.get(`user/${ref.id}`, { type: "json" }) : null;
+      const a = createHash("sha256").update(given).digest(), c = createHash("sha256").update(key).digest();
+      if (key.length < 12 || !user || !timingSafeEqual(a, c)) {
+        const count = f.count + 1;
+        await store.setJSON(failKey, count >= 5 ? { count: 0, until: Date.now() + 15 * 60_000 } : { count, until: 0 });
+        return fail(401, "Wrong email or recovery key.");
+      }
+      await store.setJSON(`user/${user.id}`, { ...user, ...hashPw(b.password) });
+      await dropSessions(store, user.id);
+      await log(store, user.id, "user.password", { how: "recovery-key" });
       return json({ token: await newSession(store, user.id), user: publicUser(user) });
     }
 
